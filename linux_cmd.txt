@@ -1,0 +1,10 @@
+
+To copy them as symlinks, use --links
+o copy the files they are pointing to, use --copy-links
+rsync -r --copy-links --exclude="./prebuilts/" . /media/zengqiang/yuxugen1/zengqiang/AOSP/
+
+-------------------------------
+nautilus dir
+-------------------------------
+
+qnx多线程log最后打不全。。。。
