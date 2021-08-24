@@ -1,0 +1,7 @@
+1, 宽口size发生变化需要重新layout
+2, 为wrap_content指定全屏幕size
+3, 判断windowsizechanged
+
+match_parent: 精准模式，windowsize
+wrap_content: 最大值，windowsize
+固定值：精准模式，指定的固定值
