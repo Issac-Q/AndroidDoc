@@ -1,0 +1,313 @@
+tcp/ip协议：
+	数据链路层-以太网/回环  src mac addr + dst mac addr + 类型； 决定MUT, 路径MUT
+	网络层-ip协议	   src ip + dst ip + 长度 作用：路由/转发 可能会分片重组，不可靠，不保证顺序，保证数据边界（送过去和读到是一样的而不会被切断）
+	传输层-tcp/udp协议 src端口 + dst端口，tcp可能会分段
+
+arp协议:用ip获取数据链路层的所需要的硬件地址，局域网内进行广播，ref:https://www.cnblogs.com/csguo/p/7527812.html
+
+
+
+
+subsys_initcall(misc_init);
+  register_chrdev
+
+
+device_initcall(binder_init);     struct binder_device：代表binder驱动，内含有miscdevice，binder_context
+  init_binder_device(device_name);	
+	misc_register(&binder_device->miscdev);
+	  device_create_with_groups
+
+
+binder_open
+  struct binder_proc *proc;		
+  proc->context = &binder_dev->context;
+  hlist_add_head(&proc->proc_node, &binder_procs);
+
+struct binder_proc *proc:代表进程，
+struct binder_thread *thread:代表线程
+
+struct flat_binder_object fbo:用户空间传入的数据结构体
+binder_ioctl
+  binder_ioctl_write_read:for read_write
+	binder_thread_write/read
+	   binder_transaction: BC_TRANSACTION/REPLAY
+		binder_translate_binder=>binder_get_node/binder_new_nod--binder_inc_ref_for_node=>binder_get_ref_for_node_olocked
+		  binder_enqueue_work: 放入进程todo链表
+		    binder_proc_transaction: 唤醒进程
+
+
+
+servicemanager BINDER_SET_CONTEXT_MGR将自己设置为mgr就是创建了一个binder_context_mgr_node
+binder_open的时候每个proc->context都指向代表binderq驱动的&binder_device->context,
+这个context是一个binder_context,内含servermanagerd的信息
+
+E:\WorkSpace\Android\AOSP\frameworks\native\cmds\servicemanager：
+
+注册服务：
+1.用handle寻找进程
+进程远程寻找过程：handle(整数)->binder_ref->binder_node（代表一个服务）->binder_proc(代表一个进程，可能有多个服务)
+2.创建代表服务的binder_node，创建引用给servicemanager
+2.拷贝数据到进程空间，将任务加入到目的进程todo链表
+3.唤醒目的进程
+
+
+
+
+
+
+
+
+数据结构篇：
+		
+用户空间：
+		binder_state
+		->fd
+		->mapped
+		->mapsize
+内核空间
+		binder_proc	//代表进程
+		->threads	//代表线程
+		->nodes		//代表服务实体,可以有多个服务
+		->refs_by_desc	//服务实体的引用，使用handle寻找
+		->refs_by_node	//服务实体的引用，使用node寻找？
+		->wating_threads	//等待处理任务的线程
+		->todo	//待处理的task
+		->context	//引用sm的binder_node，整个系统唯一
+		->alloc	//内存映射使用binder_mmap初始化
+
+		binder_thread
+		->proc	//所属进程
+		->rb_node //为了挂到proc->threads中
+		->wait_thread_node	//等到thread链表节点，为了挂到链表中的list_head
+		->todo	//todo链表
+		->wait	//wait队列
+
+		
+binder_open初始化binder_proc,并且把binder_proc放在filp->private_data中
+每个进程都会调用binder_open一次，创建代表进程的binder_proc，并把自己的binder_proc添加到全局变量binder_procs链表中
+
+binder_mmap初始化proc->alloc，分配一个物理页
+
+	binder_alloc
+	->buffer	//代表内核虚拟地址开始地址
+	->user_buufer_offset	//用户空间虚拟地址-内核虚拟地址
+	->buffer_size	//用户空间设置的size
+	->pages		//size/pagesize ,为需要的page业数分配n个page*大小空间，分配一页物理业，就创建一个page结构
+	->buffers	//binder_buffer链表
+	->free_buffers	//空闲binder_buffer
+	->vma		//用户空间传入结构体
+	->vma_vm_mm	//vma中的vm_mm
+
+	binder_buffer
+	->data = binder_alloc->buffer
+	->free = 1
+
+binder_ioctl：根据命令处理
+	用户空间：ioctl(bs->fd, BINDER_SET_CONTEXT_MGR, 0);创建binder_node,初始化，加入到proc的nodes链表中,初始化context
+	使得这个node成为binder_context_mgr_node
+
+	binder_node
+	->proc	//指向binder_proc
+	->ptr	//用户空间传输的回调函数指针
+	->refs	//node引用链表
+
+服务注册过程：
+	ioctl(bs->fd, BINDER_WRITE_READ, &bwr);
+
+	flat_binder_object
+	->hdr.type	//实体还是引用
+	->flags
+	->binder/handle	//实体就是函数指针、引用就是handle值
+	->cookie
+	
+	binder_io	
+	->data //一块512/4的buffer,这个上面放入u32/string16/flat_binder_object,	并且四字节对齐
+	
+	binder_read_write
+	->write_size	//写入长度
+	->write_consumed	//驱动程序消费的长度
+	->write_buffer	//buffer地址,等于下面writebuf地址
+	->read_size
+	->read_consumed
+	->read_buffer
+
+	writebuf
+	->cmd	//BC_TRANSACTION类似
+	->tnx(binder_transaction_data)	//取出bio数据
+
+	binder_transaction_data
+	->target.handle/ptr	//handle代表要传给谁，驱动用这个来寻找接受进程
+	->cookie
+	->code		//命令-SVC_MGR_ADD_SERVICE/SVC_MGR_GET_SERVICE
+	->flags
+	->data_szie
+	->offset_size
+	->data.ptr(buffer/offsets)/buf
+
+	binder_transaction_data_secctx
+	->binder_transaction_data
+	->secctx
+
+注册服务
+  =>ioctl进入内核：
+	=>binder_ioctl
+	  =>获取一个binder_thread，如果没有就创建，这个东西代表一个用户空间的线程，加入到proc中，初始化自己的wait_thread_node
+	  =>根据BINDER_WRITE_READ和读写size
+	  =>binder_thread_write	解析binder_write_read，去除write的cmd根据cmd值执行分支,可能有多个cmd
+	    =>binder_transaction;拿着那个binder_transaction_data开始干事情，
+				 根据传输进来的flat_binder_object创建binder_node/binde_ref
+	      =>binder_get_node_refs_for_txn;拿着mgr_node，取得SM的proc, 给mgr_node增加引用计数？
+	      =>binder_alloc_new_buf; 在内核和目标进程共同映射的空间分配buffer,并根据实际情况开辟新的物理页
+	      =>分配给binder_transation->buffer,binder_transation把用户空间的binder_transation_data的code/flags都记下来
+	      =>并记下新空间的地址/target_poc/target_thread到binder_transation，记下target_node到binder_transation->buffer中
+	      =>将iodata的offset和data拷贝进上一步创建的空间中，但是将data放在前面而offset放在后面
+
+		为每一个flat_binder_object执行以下操作，为每一个flat_binder_object创建一个binder_node
+	      =>binder_translate_binder	//根据flat_binder_onject创建node
+	        =>binder_new_node	//创建自己的node，插入到自己nodes中
+	        =>binder_inc_ref_for_node	//为目的进程创建ref,插入到目的进程的refs_by_node和refs_by_desc中
+		=>将flat_binder_onject中的type从BINDER_TYPE_BINDER修改为BINDER_TYPE_HANDLE
+		=>将flat_binder_onject中的binder（跟handle共用的，这里是回调函数指针)修改为0
+		=>将flat_binder_onject中的handle修改上面创建的引用的handle号
+	       
+	      =>binder_proc_transaction(t, target_proc, target_thread)	//将work(type为BINDER_WORK_TRANSACTION)放入目的进程的todo链表并唤醒之
+		=>优先往线程的todo链表里面放，最后放入proc的todo链表
+		=>binder_wakeup_thread_ilocked	//唤醒目的进程
+		  =>wake_up_interruptible
+
+servermanager：
+  =>ioctl进入内核：
+	=>binder_ioctl
+	=>获取一个binder_thread，如果没有就创建，这个东西代表一个用户空间的线程
+	=>根据BINDER_WRITE_READ和读写size
+	=>binder_thread_read	//取出todo链表的work节点
+	  =>先睡眠
+	  =>注册服务往todo链表里面写入work,就被唤醒
+	  =>取出trhead的todo或者proc的todo作为list,进一步取出list链表的work节点
+	  =>判断work类型为BINDER_WORK_TRANSACTION
+	  =>work放在binder_transation，根据偏移取出binder_transation，这个就是注册服务传到驱动的修改后的数据
+	  =>构造一个新的binder_transaction_data，把binder_transation取过来
+	  =>一次拷贝关键点来了，新binder_transaction_data的buffer=binder_transation+用户空间偏移
+	  =>cmd = BR_TRANSACTION;将cmd从BC_TRANSACTION改为BR_TRANSACTION
+	  =>把cmd和新的binder_transaction_data拷贝到用户空间，也就是ioctl传下来的bwr readbuf指针，consumed为在readbuf里面填充的字节数
+  =>返回用户空间继续执行
+     =>binder_parse
+	=>定义ptr = readbuf,先取出头部cmd,然后取出binder_transaction_data
+	=>构造两个bio,msg和replay，从binder_transaction_data中还原出msg
+	=>把binder_transaction_data，msg和replay作为参数回调之前注册的回调函数`
+	=>解析bio msg一次取出:
+		=>strict_policy为0，忽略
+		=>检查s 是不是 "android.os.iServiceManager"
+	=>从上面的binder_transaction_data取出code = SVC_MGR_ADD_SERVICE
+	=>取出msg中的服务名称，取出msg中的flat_binder_object中的handle（注册服务方为binder实际是回调地址）
+	=>do_add_service
+	  =>检测是否拥有添加的权限
+	  =>find_scv根据名字在svclist中寻找svcinfo，找到就返回，找不到就返回NULL
+	  =>根据结果进一步处理:
+	    =>找到了如果以前的handle有效就打印提示信息，并且调用svcinfo_death=>释放以前的handle，之后替换新handle
+	    =>没找到就创建新的svcinfo加入到svclist中
+	  =>调用binder_acquire->ioctl(BC_ACQUIRE),会用到那个的binder_transaction_data->target域
+     =>binder_send_reply->ioctl(BC_REPLAY)
+		
+相关结构体：	          
+	svcinfo
+	->svinfo
+	->handle
+	->name
+	->len（name length）
+	
+		
+		
+	binder_work
+	->entry	//链表work节点
+	->type	//work类型
+	
+	
+	binder_transation
+	->binder_work
+	->to_rpoc // = target_proc
+	->to_thread	// = target_thread
+	->code		//用户空间的binder_transaction_data的code=SVC_MGR_ADD_SERVICE
+	->flags		//用户空间的binder_transaction_data的flags
+	->binder_buffer
+
+	binder_buffer
+	->list_head
+	->binder_transation	//等于自己
+	->target_node	//target_node(目的服务node)
+	->data_size
+	->offset_size
+	->data
+
+
+	binder_bio
+	->data	//iodata+4字节，data和data0是char*，初始值data=data0=iodata+4个字
+	->offs	//iodata起始地址，offs和offs0是 binder_size_t类型指针 offs=offs0=iodata
+	->data_avail	//可用data长度，iodata长度-4个字
+	->offs_avail	//可用offs长度，iodata起始的4个字节长度
+	->data0	//记录data起始地址的
+	->offs0	//记录offs起始地址的
+	->flags	//0
+	->unused
+
+会在两个进程间流转的类型只有
+进程1(BC_TRANSACTION)=>内核=>进程2(BR_TRANSACTION)
+进程1(BR_REPLY)     <=内核<=进程2(BC_REPLY)
+
+进程1的用户空间buffer拷贝到内核空间和进程2共同映射的空间（binder驱动在代表进程2的空间中分配的），有必要就恢复reply
+进程2处理，处理完成之后，进程2向binder驱动发送释放请求，如果有必要就发送回复消息，发动进程1的映射空间，进程1收到回复也要向binder驱动发送释放空间请求
+
+以bctest.c为例子
+注册服务流程
+注册者
+  =>svcmgr_publish
+    =>binder_call      
+      =>ioctl(bs->fd, BINDER_WRITE_READ, &bwr)	//构造数据发送到驱动，驱动干了一系列准备工作之后唤醒servicemanager
+      =>binder_parse	//返回后解析从驱动返回的readbuf, 处理BR_REPLY并放到replay中（也是个binder_bio）
+			//根据BR_REPLY只是取回binder_transaction_data返回去，外面的函数负责free_buffer
+    =>binder_done	//ioctl想驱动发送BC_FREE_BUFF
+服务管理者
+  =>binder_loop
+    =>binder_write	//向驱动发送BC_ENTER_LOOP消息
+    =>ioctl(bs->fd, BINDER_WRITE_READ, &bwr)	//开始循环读取注册请求
+    =>binder_parse	//返回后解析从驱动返回的readbuf, 根据buffer干事情
+      =>svcmgr_handler	//调用回调处理函数，处理真正的注册
+      =>binder_send_reply(replay)	//发送BC_FREE_BUFFER和BC_REPLY
+
+https://github.com/weidongshan    
+
+查询服务：
+服务查询者
+  =>用户空间
+    =>svcmgr_lookup
+      =>构造binder_bio，传入服务名字，根注册差不多，就是没有flat_binder_object
+      =>binder_call  //进入使用binder驱动的lib库文件binder.c中
+	=>ioctl(BINDER_WRITE_READ)
+	  =>进入内核空间
+	    =>binder_ioctl	//根据BINDER_WRITE_READ进入
+	      =>binder_transaction	//根据BC_TRANSACTION
+	=>binder_parse(bs, reply, (uintptr_t) readbuf, bwr.read_consumed, 0);
+      =>handle = bio_get_ref(replay)	//从replay中取出请求服务的handles
+    =>binder_done //在外面发送BC_FREE_BUFFER
+
+服务管理者：
+	用户空间收到BR_TRANSACTION，就根据名字找到服务handle，
+	构造一个binder_bio，里面有一个flat_binder_object，
+	但是这次type是引用了BINDER_TYPE_HANDLE，handle就是handle值
+	binder_parse调用binder_send_reply先free刚刚用完的buffer，再发reply消息
+	进入内核空间，binder_ioctl=>binder_ioctl_write_read=>binder_thread_write=>binder_transaction
+	如果是恢复消息就根据thread->transaction_stack找到binder_transaction进而找到target_thread进一步找到target_proc
+	然后根据binder_proc分配内存，根据flat_binder_object的类型BINDER_TYPE_HANDLE循环调用binder_translate_handle
+	根据之前注册在自己用户空间的handle在自己红黑树中找到node如果是服务进程自己请求，就返回实体BINDER_TYPE_BINDER(修改type和binder变回函数指针)
+	否则就是查询进程，在他的进程里面为这个node创建一个ref，并把新生成的引用号放在flat_binder_object的handle域里面
+	添加work BINDER_WORK_TRANSACTION, 把命令修改为BR_REPLY取出数据，就然后wakeup请求进程(这时候请求进程休眠在binder_thread_read上，因为他先写后读)
+	用户空间通过bio_get_ref取回handle之后，发送binder_acquire(BC_ACQUIRE)，然后binder_done(BC_FREE_BUFFER)
+    
+
+使用服务：
+	根据handle找到target_node，找出target_node里面的服务端回调函数指针回调，这个指针是服务注册的时候放在了flat_binder_object的binder/handle联合体域中
+	并在创建服务node时放入到binder_node->ptr中，是binder还是实体在flat_binder_object的hdr.type中
+	在调用服务的时候，找到服务的node，然后取出之前放入的ptr然后放到binder_transaction_data的target.ptr域中，返回到用户空间
+
+	用户空间执行binder_parse=>进程回调函数test_server_handler=>驱动穿回来的服函数务回调target.ptr()就是hello_service_handler=>取出code和参数执行对应的处理函数syahello
+	完毕
