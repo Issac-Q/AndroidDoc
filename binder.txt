@@ -81,6 +81,7 @@ E:\WorkSpace\Android\AOSP\frameworks\native\cmds\servicemanager：
 		->wait_thread_node	//等到thread链表节点，为了挂到链表中的list_head
 		->todo	//todo链表
 		->wait	//wait队列
+		->transaction_stack
 
 		
 binder_open初始化binder_proc,并且把binder_proc放在filp->private_data中
@@ -223,10 +224,13 @@ servermanager：
 	->type	//work类型
 	
 	
-	binder_transation
+	binder_transaction
 	->binder_work
-	->to_rpoc // = target_proc
-	->to_thread	// = target_thread
+	->from 		//调用自己的线程，告诉目的进程我是谁
+	->from_parent	//调用自己线程的transaction_stack，表明我从哪里来，就是我被谁调用
+	->to_poc // = target_proc 我要发给哪一个proc
+	->to_thread	// = target_thread我要发给哪一个thread
+	->to_parent	// = thread->transaction_stack 我要去哪里
 	->code		//用户空间的binder_transaction_data的code=SVC_MGR_ADD_SERVICE
 	->flags		//用户空间的binder_transaction_data的flags
 	->binder_buffer
@@ -311,3 +315,133 @@ https://github.com/weidongshan
 
 	用户空间执行binder_parse=>进程回调函数test_server_handler=>驱动穿回来的服函数务回调target.ptr()就是hello_service_handler=>取出code和参数执行对应的处理函数syahello
 	完毕
+
+匿名binder就是
+匿名binder就是在已经建立通信的的client-service基础上，服务传递一个向client注册binder，就像有名binder注册binder一样
+
+
+
+
+binder_transaction函数分析：
+	=>binder_thread_write
+	  =>如果cmd是BC_TRANSACTION/BC_REPLY
+	  =>binder_transaction(proc, thread, binder_transaction_data:tr, reply, 0)
+	  =>这现参数都是代表调用进程的，thread->transaction_stack是开始肯定是空的
+	  =>以下分为不是回复和是回复两种case：
+	    =>不是回复
+		  =>根据handle或者0找到对应的binder_node，进一步找到target_proc
+		  =>分配一个binder_transaction:t
+		  =>分配一个——binder_work，它的成员就是一个type和list_head
+		  =>t->from = thread(代表调用线程)
+		  =>t->to_proc = target_proc
+		  =>t->code = tr->code
+		  =>t->flags = tr->flags
+		  =>t->buffer = binder_alloc_new_buffer(target_proc->alloc)	//在target进程中分配空间
+		  =>t->buffer->transaction = t;		//把t记录到binder_buffer中
+		  =>t->buffer->target_node = target_node;	//把target_node也记录到binder_buffer中
+		  =>把那段构造好的数据拷贝到t->buffer->data中
+		  =>for循环开始解析flat_binder_object结构体，分析参见R1
+		  =>tcomplete->type = BINDER_WORK_TRANSACTION_COMPLETE;
+		  =>binder_enqueue_work(proc, tcomplete, &thread->todo); //往自己的thread->todo放入一个work
+		  =>t->work.type = BINDER_WORK_TRANSACTION; 	//设定t的worktype
+		  =>t->need_reply = 1
+		  =>t->from_parent = thread->transaction_stack //开始等于NULL
+		  =>thread->transaction_stack = t	//thread的事务栈等于当前调用的t
+		    =>binder_proc_transaction(t, target_proc, target_thread)
+			=>在这里尝试找到一个等待target_thread，参考R2
+		    =>找到terget_list, 如果target_thread不为空，就是target_thread->todo否则就是target_proc->todo
+		    =>binder_enqueue_work_ilocked(&t->work, target_list);	//把之前的t.work放入target_list中
+			=>binder_wakeup_thread_ilocked(proc, thread, !oneway /* sync */);	//唤醒对应的thread
+		=>是回复
+		  =>之前调用过程中transaction_stack是怎么被赋值的参考R3
+		  =>in_reply_to = thread->transaction_stack;
+		  =>又拿到了那个t，先比较in_reply_to->thread和自己是不是相等
+		  =>从t中的from拿出调用者线程的transaction_stack和in_reply_to比较是否相等
+		  =>target_proc = target_thread->proc;	//进一步找到target_proc
+----------------------------------------------------------------------------------------------------------			
+			=>线程被唤起之后，先看自己的thread->todo中有没有事情做，否则就看proc->todo有没有事情做
+			=>从work相对binder_transaction的偏移得到t，从t恢复到tr，返回用户空间
+	  
+	R1
+	=>这个flat_binder_object就是拷贝自用户空间的那个iodata字段，
+	  =>根据flat_binder_object中的har.type是BINDER_TYPE_BINDER还是BINDER_TYPE_HANDLE两种等case处理
+	    =>对于BINDER_TYPE_BINDER
+	      =>binder_translate_binder(fp, t, thread);	//fp就是那个flat_binder_object, t就是上面构造的binder_transaction
+		  =>binder_get_node(proc， fp->binder)	//为自己创建binder_node，并把用户空间的回调函数指针放进去
+		  =>binder_inc_ref_for_node(target_proc, node,
+			fp->hdr.type == BINDER_TYPE_BINDER,
+			&thread->todo, &rdata);在目标进程的pro中创建binder引用
+		  =>修改type为BINDER_TYPE_HANDLE，
+		  =>fp->handle = rdata.desc;	//修改binder域为引用号handle
+	      =>返回到目的进程的用户空间，它就会得到修改后的信息，最重要的就是这个handle值
+		=>对于BINDER_TYPE_HANDLE
+		  =>binder_translate_handle(fp, t, thread)
+		  =>根据handle找到node，给目的进程添加node的引用，生成引用号，传回引用号
+	
+	R2
+	=>已知在binder_ioctl时会创建/获取thread，
+	  在binder_thread_read时会把这个thread放进binder_pro->waiting_threads中
+	=>调用者在binder_proc_transaction函数中，
+	  如果target_thread为空就从binder_pro->waiting_threads中选出一个thread
+	  
+	R3
+	=>在用户进程调用binder_thread_read的时候，执行：
+	=>t->to_parent = thread->transaction_stack;
+	  t->to_thread = thread;		//等被调用者返回的时候，会用自己的thread跟这个作比较，实际上就是一个
+	  thread->transaction_stack = t;	//对于调用者来说target_thread->transaction_stack = t
+	=>再加上调用者让自己的thread->transaction_stack，所有两个线程都指向t
+	
+	
+1. 发给谁
+2. 回给谁
+
+		A														              B
+		=>BC_TRANSACTION                                                      =>BR_TRANSACTION
+		  =>写入时，通过from_parent入A栈，thread->transaction_stack = t		    =>读取时，通过to_parent入B栈，thread->transaction_stack = t
+									.from = A
+									.to_proc = B
+									.to_thread = B下的某个线程
+		=>BR_REPLY												              =>BC_REPLY
+																                =>从栈中取出from，知道回给谁
+																                =>通过to_parent出B栈，thread->transaction_stack = in_reply_to->to_parent;
+																                =>通过from_parent出A栈，target_thread->transaction_stack = target_thread->transaction_stack->from_parent;
+																  
+		双向传输
+			A->B还没处理完，又要用到A的服务，类似于回复过程，只不过回复过程直接拿thread->transaction_stack当做in_reply_to
+
+
+transaction_stack总结
+	1.发送binder_transaction函数分析
+	=>把用户空间的bindert_transaction_data转换为驱动需要的binder_transaction也就是t，位于内核空间
+	=>t->from_parent = thread->transaction_stack;
+	=>thread->transaction_stack = t
+	=>这两句使得，thread的栈等于t，而t的from_parent记录之前的thread栈
+	...
+	=>唤醒线程
+	
+	2.binder_thread_read
+	=>根据work得到上面的那个t
+	=>t->to_parent = thread->transaction_stack;
+	=>thread->transaction_stack = t;
+	=>这两句使得thread的栈等于t，而t的to_parent记录之前的thread栈
+	...
+	=>返回用户空间
+	
+	3.回复binder_transaction函数分析
+	=>in_reply_to = thread->transaction_stack;	//取回面记录的thread栈也就是t
+	=>thread->transaction_stack = in_reply_to->to_parent;	//把服务thread栈恢复到步骤2之前，对服务的thread就像什么都没发生过一样，因为它已经完成了使命
+	=>target_thread->transaction_stack = target_thread->transaction_stack->from_parent;	//把请求thread栈恢复到步骤1之前
+	=>binder_free_transaction(in_reply_to)	//事务完成，free之
+	
+	
+	
+	
+	
+	
+	
+	
+TODO
+binder系统笔记整理
+数据结构梳理
+调用过程分析
+关键点解释
