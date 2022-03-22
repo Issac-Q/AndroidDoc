@@ -435,10 +435,118 @@ transaction_stack总结
 	
 	
 	
+服务多线程实现：
+  =>每次binder_thread_read的时候，在最后会根据目前proc->waiting_threads为0，又没有向用户空间请求新的线程，就添加一个BR_SPAWN_LOOPER
+  =>if (proc->requested_threads == 0 &&
+	    list_empty(&thread->proc->waiting_threads) &&
+	    proc->requested_threads_started < proc->max_threads &&
+	    (thread->looper & (BINDER_LOOPER_STATE_REGISTERED |
+	     BINDER_LOOPER_STATE_ENTERED)) /* the user-space code fails to */
+	     /*spawn a new thread if we leave this out */) {
+		proc->requested_threads++;
+		put_user(BR_SPAWN_LOOPER, (uint32_t __user *)buffer)
+	}
+  =>用户空间收到请求，创建一个新线程之后，首先ioctl发送BC_REGISTER_LOOPER，然后让新线程进入循环跟主线程一样读数据，然后进入休眠被放入pro->waiting_threads中等待处理新的client请求
+  =>case BC_REGISTER_LOOPER:
+		proc->requested_threads--;
+		proc->requested_threads_started++;
 	
 	
+
+用户层C++框架，定义接口类，service和client都继承实现，service叫BnXXX，client叫BpXXX	
+public virtual class是解决菱形问题的
+
+android 用户空间C++层框架：
+=>ProcessState		//实例化的时候，单例模式进程唯一，
+   =>open_binder //获取版本，设置最大线程为15，
+   =>mmap	//映射空间
+   =>becomeContextManager	//设置servicemanager
+   =>设置最大线程数
+   =>创建新线程		//new PoolThread(isMain); 执行函数threadLoop=>IPCThreadState::self()->joinThreadPool(mIsMain);成为一个binder线程
 	
+=>IPChreadState
+  =>joinThreadPool	//发一个isMain ? BC_ENTER_LOOPER : BC_REGISTER_LOOPER给驱动并进入循环读数据，成为一个binder线程
+	=>getAndExecuteCommand	//如果有数据就写入，并且开始读数据并处理
+	  =>talkWithDriver		//调用ioctl先写再读，mOut写入驱动， mIn读出驱动
+	  =>excuteCommand		//根据BR_XXX分别处理
 	
+
+一个C++ binder C/S，始于一个IXXXService
+
+=>对于客户端
+//open binder, mmap
+1. sp<ProcessState> proc(ProcessState::self());
+
+//得到BnServiceManager单例，实际是一个handle = 0的BpBinder的桥接？
+2. sp<IServiceManager> sm = defaultServiceManager();
+
+//通过根据名字获取服务，用内核返回的handle创建一个BpBinder
+3. sp<IBinder> binder = sm->getService(name)
+
+//创建BpHelloService，作为BpBinder的桥接来使用BpBinder提供的功能
+4. sp<IHelloService> service = interface_cast<IHelloService>(binder);
+
+//调用函数
+4. service->sayhello()
+
+=>对于服务端
+//open binder, mmap
+1. sp<ProcessState> proc(ProcessState::self());
+
+//得到BnServiceManager单例，实际是一个handle = 0的BpBinder的桥接？
+2. sp<IServiceManager> sm = defaultServiceManager();
+
+//使用名字注册服务，把BnHelloService通过flat_binder_object传给内核
+3. sm->addService(String16("hello"), new BnHelloService(sockets[1]));
+
+//增加子线程，线程运行起来之后接着第5步
+4. ProcessState::self()->startThreadPool();
+
+//进入循环读取，取回第三的BnHelloService，调用它的transact
+5. IPCThreadState::self()->joinThreadPool();
+
+	=>defaultServiceManager
+		gDefaultServiceManager = interface_cast<IServiceManager>(
+			ProcessState::self()->getContextObject(NULL));	//创建一个BpBinder对象而已,根据handle调用getStrongProxyForHandle创建				
+			调用IServiceManager::asInterface(IBinder&)		//其实就是在用上一步的BpBinder对象作为参数调用BpServiceManager的构造函数,参数最终传递给了其父类BpRefBase的mRemote
+			//总结：用handle(0)创建一个BpBinder对象，用这个BpBinder对象创建一个BpServiceManager
+				
+	=>remote()->transact	//发送数据就是调用BpBinder的transact，BpBinder没什么特别，就是有个mHandle而已
+	  =>BpBinder->transact；IPCThreadState::self()->transact(mHandle, code, data, reply, flags);	//转到IPCProcessState
+	    =>writeTransactionData	//构造函数
+	    =>waitForResponse		//发送数据给驱动
+		  =>talkWithDriver
+			=>ioctl
+			
+	注册service
+	=>addService(BnHelloService)
+	  =>Parcel::writeStrongBinder
+	    =>flatten_binder
+		  =>obj.type = BINDER_TYPE_BINDER;
+            obj.binder = reinterpret_cast<uintptr_t>(local->getWeakRefs());		//local就是BnHelloService
+            obj.cookie = reinterpret_cast<uintptr_t>(local);
+	
+	回调处理
+	=>IPCThreadState::joinThreadPool
+	  =>getAndExecuteCommand	//如果有数据就写入，并且开始读数据并处理
+	    =>talkWithDriver		//调用ioctl先写再读，mOut写入驱动， mIn读出驱动
+	    =>excuteCommand		//根据BR_XXX分别处理，把之前传的ptr取出来作为BnHelloService，调用它的transact
+		  =>if (reinterpret_cast<RefBase::weakref_type*>(tr.target.ptr)->attemptIncStrong(this)) {
+                error = reinterpret_cast<BBinder*>(tr.cookie)->transact(tr.code, buffer, &reply, tr.flags);
+                reinterpret_cast<BBinder*>(tr.cookie)->decStrong(this);
+            }
+			=>onTransact	//BnHelloService真正实现的
+			
+	请求service
+	=>getService(name)
+	  =>Parcel::readStrongBinder
+	    =>readNullableStrongBinder
+	      =>getStrongProxyForHandle(flat->handle)	//用内核创建的引用handle创建一个新的BpBinder
+	=>sp<IHelloService> service = interface_cast<IHelloService>(binder);  //创建BpXXXService，拿着上一步创建的BpBinder开始使用服务
+	
+	  
+
+	双向传输：
 	
 TODO
 binder系统笔记整理
