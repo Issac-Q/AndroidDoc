@@ -1,3 +1,4 @@
+/******************|android commands|*****************/
 am start -n ｛包(package)名｝/｛包名｝.{活动(activity)名称}
 am start -n com.android.browser/com.android.browser.BrowserActivity
 am startservice -n ｛包(package)名｝/｛包名｝.{服务(service)名称}
@@ -16,19 +17,18 @@ dumpsys iauto.system.sysctrlmanager     //java服务的dump,调用dump函数
 lshal | grep {服务名}   //列出native服务
 lshal debug iauto.hardware.sysctrl@1.0::ISysCtrl/default    //native服务，调用debug函数
 
+/******************|ubuntu 卡死解决办法|*****************/
 ubuntu：
 进入命令行方法：Ctrl + Alt + F1(F7就是桌面)
 桌面卡死安全重启办法：
 1. 同时按住 Ctrl 和 Alt 键，执行2、3步骤都一直按住不要放
 2. 按顺序依次按下PrtSc键（或者SysRq 键）, R , E , I , S , U , B 键
 
-
+/******************|android binder和hwbinder的相关封装代码|*****************/
 android 9以及以前的代码，没有C++封装，更容易分析跟驱动的交互过程：
 binder Servicemanager位置：/frameworks/native/cmds/servicemanager/
 android 8才有的hwbinder
 hwbinder Servicemanager位置：/system/hwservicemanager/
-
-ServiceManager和普通进程的区别是前者会调用becomeContextManager
 
 defaultServiceManager是用来获取ServiceManager引用的，代码运行在Clinet进程
 binder 位置：frameworks/native/libs/binder/IServiceManager.cpp
@@ -38,12 +38,14 @@ aidl native服务和hidl native服务的区别
 aidl mgr: IServiceManager addService
 hidl ngr: ServiceManagment registerAsService
 
+/******************|android binder进程|*****************/
 binder/vdnbinder: 
 framework/native/libs/binder:
 =>ProcessState.cpp
 =>IServiceManager.cpp =>addService
 hwbinder: system/libhwbinder
 
+ServiceManager和普通进程的区别是前者会调用becomeContextManager
 对于每一个android进程来说第一步就是open binder设备文件并初始化
 ex: main_mediaserver.cpp
 1 sp<ProcessState> proc(ProcessState::self());
@@ -52,6 +54,7 @@ ex: main_mediaserver.cpp
 1.3. mmap
 2 sp<IServiceManager> sm(defaultServiceManager());
     获取serviceManager 引用也就是new BpServiceManager(new BpBinder(0))
+/******************|android binder 服务端进程|*****************/
 3. MediaPlayerService::instantiate();
     //对于服务端添加服务
     defaultServiceManager()->addService(
@@ -68,7 +71,7 @@ ex: main_mediaserver.cpp
     //Android 10就是手写的BpServiceManager代码，以后都是生成的
     //class BpServiceManager : public BpInterface<IServiceManager>
 
-BnXXX的类封装
+/******************|android binder BnXXX的类封装|*****************/
 class [[clang::lto_visibility_public]] IBinder : public virtual RefBase
     transact();
     linkToDeath();
@@ -101,7 +104,7 @@ class MediaPlayerService : public BnMediaPlayerService;
 当client请求的时候，就对象到这个指针了，调用其onTransact函数，然后根据code值调用子类具体函数
 也可以进程内通信，transact直接调用自己onTransact
 
-//BnXXX和BpXXX共通父类
+/******************|android binder BnXXX和BpXXX共通父类|*****************/
 class IInterface : public virtual RefBase;
 {
     RefBase是实现引用计数的
@@ -114,7 +117,7 @@ class IMediaPlayerService: public IInterface;
     //定义纯虚跨进程通信接口
 }
 
-BpXXX的类封装
+/******************|android binder BpXXX的类封装|*****************/
 class BpRefBase : public virtual RefBase
 {
     RefBase是实现引用计数的
@@ -133,7 +136,7 @@ class BpMediaPlayerService: public BpInterface<IMediaPlayerService>
     remote()->transact(LISTEN_FOR_REMOTE_DISPLAY, data, &reply);
 }
 
-//对于客户端来说
+/******************|android binder 客户端进程|*****************/
 1. sp<IServiceManager> sm = defaultServiceManager();    //获取SMGR
    sp<IBinder> binder = getService(String16("media.player"));   //获取远程服务(里面有handle)
    binder->linkToDeath(sDeathNotifier);                 //注册死亡代理
@@ -180,6 +183,8 @@ class BpMediaPlayerService: public BpInterface<IMediaPlayerService>
    =>ioctl(mProcess->mDriverFD, BINDER_WRITE_READ, &bwr);
    可知最终就是包装目标和数据丢给binder驱动
 
+
+/******************|android binder进程/线程相关类封装|*****************/
 对Binder的IO操作C++封装:
 ProcessState: 代表binder进程
 IPCThreadState: 代表bidner线程
@@ -195,7 +200,7 @@ IPCThreadState::joinThreadPool()    //将线程成为处理bidner请求的专用
 ProcessState::startThreadPool()     //开启子线程，然后在子线程中重复上一步
     =>开启子线程，并在子线程执行IPCThreadState::joinThreadPool()让其变为binder线程
 
-
+/******************|android 虚拟机编译优化|*****************/
 4. Android App优化
     a. Android 2.2 使用JIT(缓存热点代码-内存级别)
     b. Android 4.4 引入ART(使用AOT编译，即在安装时就解释成机器代码)
@@ -209,10 +214,12 @@ ProcessState::startThreadPool()     //开启子线程，然后在子线程中重
        用户下载的时候就可以提前有一个Profile来做AOT了
     e. 2022 I/O 引入 Baseline profile，可以提前使用工具自动生成Profile(把自动生成的工作提取到开发阶段了)
 
+/******************|android 进程|*****************/
 android分为 原生进程和java进程
 原生进程就是C/C++进程
 java进程就是原生虚拟机程序+java代码
 
+/******************|android 虚拟机原理|*****************/
 Android虚拟机原理
 AndroidRuntime作为入口
 1. 加载libart.so
@@ -223,7 +230,7 @@ AndroidRuntime作为入口
 3. 在安装的时候PMS请求守护进程installd
    将dex优化为odex(run_dexopt)或者转化为oat(run_dex2oat)机器码
 
-
+/******************|android 启动Zygote进程过程|*****************/
 android启动Zygote进程
 1. init进程解析init.rc配置文件，/system/bin/app_process -Xzygote /system/bin --zygote --start-system-server
 2. app_process native进程的main函数启动ART虚拟机，调用ART的start方法
@@ -231,6 +238,7 @@ android启动Zygote进程
 4. 创建Socket服务接受AMS的创建新进程的请求
 5. 创建SystemServer进程(AMS，WMS, PMS等都在里面， 一个进程可以有多个binder实例/服务)
 
+/******************|android Zygote启动App进程过程|*****************/
 Zygote启动App进程
 1. App startActivity => AMS
 2. AMS检查如果需要新建进程就是发送Socket请求到Zygote
@@ -245,3 +253,11 @@ Zygote启动App进程
     }
 6. 新进程找到类的main函数然后调用，也就是ActiviityThread的main函数
 7. 新进程虎仔attach方法向AMS注册自己，接下来就可以和AMS双向通信了
+
+/******************|Linux 文件描述符和fork的注意点|*****************/
+1. 文件描述符分为进程表(指向文件表项)，文件表(文件偏移信息)，node表(代表物理文件)
+2. open会新建进程表项和文件表项
+3. dup会复制进程表项，指向之前的文件表项
+4. fork之后会复制fd, 指向之前的文件表项，类似于dup
+5. close只会剪断自我进程内的进程表项到文件表项的链接
+6. 通过进程间通信传递fd应该是不可行(除非fork)，待验证
