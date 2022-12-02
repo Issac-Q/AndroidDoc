@@ -261,3 +261,12 @@ Zygote启动App进程
 4. fork之后会复制fd, 指向之前的文件表项，类似于dup
 5. close只会剪断自我进程内的进程表项到文件表项的链接
 6. 通过进程间通信传递fd应该是不可行(除非fork)，待验证
+
+/******************|android Java层Binder客户端|*****************/
+1. 客户端BinderProxy请求
+   =>transact()
+   =>transactNative()
+   =>android_os_BinderProxy_transact();
+   //获取BpBinder对象
+   =>IBinder* target = getBPNativeData(env, obj)->mObject.get();
+   =>target->transact(code, *data, reply, flags)
