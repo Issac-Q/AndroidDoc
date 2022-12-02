@@ -1,0 +1,247 @@
+am start -n ｛包(package)名｝/｛包名｝.{活动(activity)名称}
+am start -n com.android.browser/com.android.browser.BrowserActivity
+am startservice -n ｛包(package)名｝/｛包名｝.{服务(service)名称}
+am startservice -n com.android.traffic/com.android.traffic.maniservice
+am broadcast -a <广播动作>
+am broadcast -a android.net.conn.CONNECTIVITY_CHANGE
+logcat -s Tag
+logcat | grep SysCtrl > /vendor/log.txt&
+setprop persist.log.tag S   //关闭所有log
+setprop persist.log.tag.SysCtrlTag V    //打开自己的log, 查看所有
+adb shell install -r apk
+
+dumpsys -l | grep sysctrl   //列出java服务
+dumpsys iauto.system.sysctrlmanager     //java服务的dump,调用dump函数
+
+lshal | grep {服务名}   //列出native服务
+lshal debug iauto.hardware.sysctrl@1.0::ISysCtrl/default    //native服务，调用debug函数
+
+ubuntu：
+进入命令行方法：Ctrl + Alt + F1(F7就是桌面)
+桌面卡死安全重启办法：
+1. 同时按住 Ctrl 和 Alt 键，执行2、3步骤都一直按住不要放
+2. 按顺序依次按下PrtSc键（或者SysRq 键）, R , E , I , S , U , B 键
+
+
+android 9以及以前的代码，没有C++封装，更容易分析跟驱动的交互过程：
+binder Servicemanager位置：/frameworks/native/cmds/servicemanager/
+android 8才有的hwbinder
+hwbinder Servicemanager位置：/system/hwservicemanager/
+
+ServiceManager和普通进程的区别是前者会调用becomeContextManager
+
+defaultServiceManager是用来获取ServiceManager引用的，代码运行在Clinet进程
+binder 位置：frameworks/native/libs/binder/IServiceManager.cpp
+hwbinder 位置： system/libhidl/transport/ServiceManagement.cpp
+
+aidl native服务和hidl native服务的区别
+aidl mgr: IServiceManager addService
+hidl ngr: ServiceManagment registerAsService
+
+binder/vdnbinder: 
+framework/native/libs/binder:
+=>ProcessState.cpp
+=>IServiceManager.cpp =>addService
+hwbinder: system/libhwbinder
+
+对于每一个android进程来说第一步就是open binder设备文件并初始化
+ex: main_mediaserver.cpp
+1 sp<ProcessState> proc(ProcessState::self());
+1.1. open
+1.2. ioctl
+1.3. mmap
+2 sp<IServiceManager> sm(defaultServiceManager());
+    获取serviceManager 引用也就是new BpServiceManager(new BpBinder(0))
+3. MediaPlayerService::instantiate();
+    //对于服务端添加服务
+    defaultServiceManager()->addService(
+                String16("media.player"), new MediaPlayerService());
+    {生成的BpServiceManager代码，根据名字远程请求添加一个服务， android 11以前是手写的代码在IServiceManager中
+        Parcel data, reply;
+        data.writeInterfaceToken(IServiceManager::getInterfaceDescriptor());
+        data.writeString16(name);
+        data.writeStrongBinder(service);
+        data.writeInt32(allowIsolated ? 1 : 0);
+        data.writeInt32(dumpsysPriority);
+        status_t err = remote()->transact(ADD_SERVICE_TRANSACTION, data, &reply);
+    }
+    //Android 10就是手写的BpServiceManager代码，以后都是生成的
+    //class BpServiceManager : public BpInterface<IServiceManager>
+
+BnXXX的类封装
+class [[clang::lto_visibility_public]] IBinder : public virtual RefBase
+    transact();
+    linkToDeath();
+    class DeathRecipient : public virtual RefBase
+        public void binderDied() = 0;
+    }
+}
+class BBinder : public IBinder;
+{
+    transact();
+    onTransact();
+    linkToDeath();
+}
+ template<typename INTERFACE>;
+class BnInterface : public INTERFACE, public BBinder;
+{
+    virtual sp<IInterface>      queryLocalInterface(const String16& _descriptor);
+    virtual const String16&     getInterfaceDescriptor() const;
+}
+class BnMediaPlayerService: public BnInterface<IMediaPlayerService>;
+{
+    //解析数据根据code调用子类实现的IMediaPlayerService接口
+    onTransact();
+}
+class MediaPlayerService : public BnMediaPlayerService;
+{
+    //实现IMediaPlayerService定义跨进程的接口
+}
+注册服务的时候将这个MediaPlayerService对象的地址传输到驱动中，代表驱动层binder实体
+当client请求的时候，就对象到这个指针了，调用其onTransact函数，然后根据code值调用子类具体函数
+也可以进程内通信，transact直接调用自己onTransact
+
+//BnXXX和BpXXX共通父类
+class IInterface : public virtual RefBase;
+{
+    RefBase是实现引用计数的
+    //转化为binder
+    asBinder();
+}
+class IMediaPlayerService: public IInterface;
+{
+    DECLARE_META_INTERFACE(MediaPlayerService);
+    //定义纯虚跨进程通信接口
+}
+
+BpXXX的类封装
+class BpRefBase : public virtual RefBase
+{
+    RefBase是实现引用计数的
+    //得到远程binder的handle封装对象
+    remote()
+}
+template<typename INTERFACE>
+class BpInterface : public INTERFACE, public BpRefBase;
+{
+    //构造函数，传入远程binder服务的handle封装对象
+    BpInterface(const sp<IBinder>& remote);
+}
+class BpMediaPlayerService: public BpInterface<IMediaPlayerService>
+{
+    //实现IMediaPlayerService的跨进程借口，实际就是使用remote想binder传输参数
+    remote()->transact(LISTEN_FOR_REMOTE_DISPLAY, data, &reply);
+}
+
+//对于客户端来说
+1. sp<IServiceManager> sm = defaultServiceManager();    //获取SMGR
+   sp<IBinder> binder = getService(String16("media.player"));   //获取远程服务(里面有handle)
+   binder->linkToDeath(sDeathNotifier);                 //注册死亡代理
+   //最重要的一步，就是通过IMediaPlayerService::asInterface()
+   //                                       =>queryLocalInterface默认返回0
+   //interface_cast<IClassName>(binder)展开后就是返回 new BpClassName(binder);
+   //最后返回new BpMediaPlayerService(binder);
+   const sp<IMediaPlayerService> sService = interface_cast<IMediaPlayerService>(binder);
+2. 也就是说BpXXX是对从SMGR获取的远程服务remote的一个包裹类，将客户端的请求都转送到远程服务remote
+3. 看看remote是个什么玩意
+    3.1 先看defaultServiceManager();
+             using AidlServiceManager = android::os::IServiceManager;
+           =>sm = interface_cast<AidlServiceManager>(ProcessState::self()->getContextObject(nullptr));
+           =>sm = new BpServiceManager(ProcessState::self()->getContextObject(nullptr));
+           =>ProcessState::self()->getContextObject(nullptr)
+           =>sp<IBinder> context = getStrongProxyForHandle(handle); //handle = 0代表SMGR
+           =>sp<BpBinder> b = BpBinder::create(handle); //实际就是new BpBinder(0)
+        所以defaultServiceManager()就是个new BpServiceManager(new BpBinder(0)), 
+        new BpBinder(0)就是BpServiceManager的remote
+    3.2 再看sm->getService返回什么
+        //Android 10就是BpServiceManager代码
+        //class BpServiceManager : public BpInterface<IServiceManager>
+        {   //生成的代码，根据名字远程请求一个handle存在Parcel中
+            Parcel data, reply;
+            data.writeInterfaceToken(IServiceManager::getInterfaceDescriptor());
+            data.writeString16(name);
+            remote()->transact(CHECK_SERVICE_TRANSACTION, data, &reply);
+            return reply.readStrongBinder();
+        }
+            =>readNullableStrongBinder()
+            =>unflattenBinder()
+            =<sp<IBinder> binder = ProcessState::self()->getStrongProxyForHandle(flat->handle);
+        所以最终还是使用远程获取的handle调用getStrongProxyForHandle得到new BpBinder(handle)
+
+//最后看看remote()->transact()干了什么
+1. 明确remote()是一个BpBinder(handle)
+2. Bpinder::transact()
+   =>IPCThreadState::self()->transact(binderHandle(), code, data, reply, flags);
+   //根据歇息写入把请求信息数据写入Parcel，放在变量mOut中
+   =>writeTransactionData(BC_TRANSACTION, flags, handle, code, data, nullptr);
+   =>waitForResponse();
+   =>talkWithDriver();
+   =>bwr.write_buffer = (uintptr_t)mOut.data();
+   =>ioctl(mProcess->mDriverFD, BINDER_WRITE_READ, &bwr);
+   可知最终就是包装目标和数据丢给binder驱动
+
+对Binder的IO操作C++封装:
+ProcessState: 代表binder进程
+IPCThreadState: 代表bidner线程
+
+ProcessState::self()
+  =>open_driver(open binder/ioctl/mmap)
+IPCThreadState::self()
+  =>ProcessState::self()
+
+IPCThreadState::joinThreadPool()    //将线程成为处理bidner请求的专用线程
+    =>线程开始循环读取binder驱动的数据，如果读取到就返回用户空间执行，否则block
+
+ProcessState::startThreadPool()     //开启子线程，然后在子线程中重复上一步
+    =>开启子线程，并在子线程执行IPCThreadState::joinThreadPool()让其变为binder线程
+
+
+4. Android App优化
+    a. Android 2.2 使用JIT(缓存热点代码-内存级别)
+    b. Android 4.4 引入ART(使用AOT编译，即在安装时就解释成机器代码)
+       AOT(Ahead of time)编译的缺点是安装时间长，而且机器码会更大
+    b. Android 5.0 完全替代Dalvik
+    c. Android 7.0 为了平衡，使用JIT+AOT+Profile方式
+       AOT(All of the time)
+       JIT的时候会把热点代码信息写入Profile文件
+       空闲的时候，根据Profile文件编译并持久化(APK+Profile)
+    d. Android 9.0 引入cloud profile，也就是把用户的Profile上传到Google Play
+       用户下载的时候就可以提前有一个Profile来做AOT了
+    e. 2022 I/O 引入 Baseline profile，可以提前使用工具自动生成Profile(把自动生成的工作提取到开发阶段了)
+
+android分为 原生进程和java进程
+原生进程就是C/C++进程
+java进程就是原生虚拟机程序+java代码
+
+Android虚拟机原理
+AndroidRuntime作为入口
+1. 加载libart.so
+2. 根据symbol导出libart.so中的函数指针
+    *JNI_GetDefaultJavaVMInitArgs
+    *JNI_CreateJavaVM
+    *JNI_GetCreatedJavaVMs
+3. 在安装的时候PMS请求守护进程installd
+   将dex优化为odex(run_dexopt)或者转化为oat(run_dex2oat)机器码
+
+
+android启动Zygote进程
+1. init进程解析init.rc配置文件，/system/bin/app_process -Xzygote /system/bin --zygote --start-system-server
+2. app_process native进程的main函数启动ART虚拟机，调用ART的start方法
+3. ART虚拟找到Java类的main函数然后执行，进入Java层执行，Java进程Zygote启动起来了
+4. 创建Socket服务接受AMS的创建新进程的请求
+5. 创建SystemServer进程(AMS，WMS, PMS等都在里面， 一个进程可以有多个binder实例/服务)
+
+Zygote启动App进程
+1. App startActivity => AMS
+2. AMS检查如果需要新建进程就是发送Socket请求到Zygote
+3. Zygote通过jni 调用native层fork出新进程
+4. 在新进程close socket(继承父进程的)
+5. 新进程中调用native 将自己变为binder进程-创建
+	virtual void onZygoteInit()
+  	{
+       sp<ProcessState> proc = ProcessState::self();
+       ALOGV("App process: starting thread pool.\n");
+       proc->startThreadPool();
+    }
+6. 新进程找到类的main函数然后调用，也就是ActiviityThread的main函数
+7. 新进程虎仔attach方法向AMS注册自己，接下来就可以和AMS双向通信了
