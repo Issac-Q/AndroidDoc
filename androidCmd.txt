@@ -56,7 +56,8 @@ ex: main_mediaserver.cpp
     获取serviceManager 引用也就是new BpServiceManager(new BpBinder(0))
 /******************|android binder 服务端进程|*****************/
 3. MediaPlayerService::instantiate();
-    //对于服务端添加服务
+    //对于服务端添加服务， 匿名binder也是这样，
+    //本质是通过驱动传递binder对象, 把对象存在内核，把handle传给对端
     defaultServiceManager()->addService(
                 String16("media.player"), new MediaPlayerService());
     {生成的BpServiceManager代码，根据名字远程请求添加一个服务， android 11以前是手写的代码在IServiceManager中
@@ -116,6 +117,23 @@ class IMediaPlayerService: public IInterface;
     DECLARE_META_INTERFACE(MediaPlayerService);
     //定义纯虚跨进程通信接口
 }
+4. 最后看看服务端是怎么响应请求的
+IPCThreadState代表一个Binder线程，在没有数据的时候就陷入block
+    IPCThreadState::joinThreadPool(); //循环读取binder请求
+    =>getAndExecuteCommand();         //如果读取到了就根据参数处理
+    =>talkWithDriver();               //首先从驱动读取请求数据
+    =>executeCommand();               //开始执行请求
+    =>case BR_TRANSACTION:            //处理事务(接口调用都是事务)
+        reinterpret_cast<BBinder*>(tr.cookie)->transact(tr.code, buffer,
+                            &reply, tr.flags);
+    =>onTransact(code, data, reply, flags)  //transact调用子类onTransact(), 调用完毕;
+5. 再看看返回值，如果需要返回值就把返回值写在replay里面
+    =>sendReply(reply, (tr.flags & kForwardReplyFlags));
+    =>{
+        writeTransactionData(BC_REPLY, flags, -1, 0, reply, &statusBuffer); //数据写入mOut中
+        return waitForResponse(nullptr, nullptr);   //调用talkWithDriver将mOut的数据发送到Binder驱动
+    }
+    最后由Binder驱动将数据“发送”到调用进程
 
 /******************|android binder BpXXX的类封装|*****************/
 class BpRefBase : public virtual RefBase
@@ -183,7 +201,6 @@ class BpMediaPlayerService: public BpInterface<IMediaPlayerService>
    =>ioctl(mProcess->mDriverFD, BINDER_WRITE_READ, &bwr);
    可知最终就是包装目标和数据丢给binder驱动
 
-
 /******************|android binder进程/线程相关类封装|*****************/
 对Binder的IO操作C++封装:
 ProcessState: 代表binder进程
@@ -199,6 +216,42 @@ IPCThreadState::joinThreadPool()    //将线程成为处理bidner请求的专用
 
 ProcessState::startThreadPool()     //开启子线程，然后在子线程中重复上一步
     =>开启子线程，并在子线程执行IPCThreadState::joinThreadPool()让其变为binder线程
+
+/******************|android 匿名binder|*****************/
+匿名binder：不用注册到SMGR的binder，在已经建立的binder通道获取其进程的Binder对象服务(未注册)
+看看通过BnMediaPlayerService怎么获取BnMediaPlayer服务
+1. BnMediaPlayerService的onTransact函数
+{
+    case CREATE: {
+        CHECK_INTERFACE(IMediaPlayerService, data, reply);
+        sp<IMediaPlayerClient> client =
+            interface_cast<IMediaPlayerClient>(data.readStrongBinder());
+        audio_session_t audioSessionId = (audio_session_t) data.readInt32();
+        AttributionSourceState attributionSource;
+        status_t status = data.readParcelable(&attributionSource);
+        if (status != NO_ERROR) {
+            return status;
+        }
+        sp<IMediaPlayer> player = create(client, audioSessionId, attributionSource);
+        reply->writeStrongBinder(IInterface::asBinder(player));
+        return NO_ERROR;
+    } break;
+}
+2. IInterface::asBinder函数
+class IInterface
+{
+    static sp<IBinder>  asBinder(const IInterface*);
+    static sp<IBinder>  asBinder(const sp<IInterface>&);
+    virtual IBinder*            onAsBinder() = 0;
+    //对于BnXXX返回This, 对于BpXXX返回remote()(remote本身是包裹handle的BpBinder)
+    reply->writeStrongBinder(IInterface::asBinder(player));
+    return sp<IBinder>::fromExisting(const_cast<IInterface*>(iface)->onAsBinder());
+}
+3. 获取的代码最关键的一行：reply->writeStrongBinder(BnMediaPlayer*);
+   然后会在IPCThreadState中的excuteCommand中讲reply数据通过talkToDriver传递到Binder驱动
+   最后跟向SMGR注册驱动一样，
+   Binder驱动会内核中为本进程创建BinderNode(包含Binder对象)，为对端进程创建BinderRef(包含handle)
+   并建立映射handle到BinderNode的映射关系(通过红黑树实现)
 
 /******************|android 虚拟机编译优化|*****************/
 4. Android App优化
