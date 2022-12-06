@@ -82,9 +82,12 @@ class [[clang::lto_visibility_public]] IBinder : public virtual RefBase
 }
 class BBinder : public IBinder;
 {
-    transact();
-    onTransact();
+    onTransact();   //接受
     linkToDeath();
+}
+class BpBinder : public IBinder {
+    mHandle //这就是那个跨进程的引用号handle
+    transact(); //发送
 }
  template<typename INTERFACE>;
 class BnInterface : public INTERFACE, public BBinder;
@@ -118,6 +121,10 @@ class IMediaPlayerService: public IInterface;
     //定义纯虚跨进程通信接口
 }
 4. 最后看看服务端是怎么响应请求的
+//binder驱动从内核返回用户空间，用户空间遇到BR_SPAWN_LOOPER，就创建通过mProcess->spawnPooledThread(false);
+//异步创建新线程，并使之成为Binder线程IPCThreadState::self()->joinThreadPool(mIsMain);
+//对于同一个请求线程，即使是oneWay方式请求，Service对其处理一定是按顺序的
+//也就是虽然client,不等待，但是Service的对接下来的处理是串行进行的
 IPCThreadState代表一个Binder线程，在没有数据的时候就陷入block
     IPCThreadState::joinThreadPool(); //循环读取binder请求
     =>getAndExecuteCommand();         //如果读取到了就根据参数处理
@@ -159,10 +166,18 @@ class BpMediaPlayerService: public BpInterface<IMediaPlayerService>
    sp<IBinder> binder = getService(String16("media.player"));   //获取远程服务(里面有handle)
    binder->linkToDeath(sDeathNotifier);                 //注册死亡代理
    //最重要的一步，就是通过IMediaPlayerService::asInterface()
-   //                                       =>queryLocalInterface默认返回0
+   //                                       =>queryLocalInterface默认返回this
    //interface_cast<IClassName>(binder)展开后就是返回 new BpClassName(binder);
    //最后返回new BpMediaPlayerService(binder);
    const sp<IMediaPlayerService> sService = interface_cast<IMediaPlayerService>(binder);
+   //
+ template<typename INTERFACE>
+ inline sp<INTERFACE> interface_cast(const sp<IBinder>& obj)
+ {
+    return INTERFACE::asInterface(obj);
+ }
+ //asInterface是使用宏DECLARE_META_INTERFACE声明和使用宏IMPLEMENT_META_INTERFACE定义
+ //这两个宏在IXXX中引入成静态函数
 2. 也就是说BpXXX是对从SMGR获取的远程服务remote的一个包裹类，将客户端的请求都转送到远程服务remote
 3. 看看remote是个什么玩意
     3.1 先看defaultServiceManager();
@@ -177,6 +192,7 @@ class BpMediaPlayerService: public BpInterface<IMediaPlayerService>
     3.2 再看sm->getService返回什么
         //Android 10就是BpServiceManager代码
         //class BpServiceManager : public BpInterface<IServiceManager>
+        getService()
         {   //生成的代码，根据名字远程请求一个handle存在Parcel中
             Parcel data, reply;
             data.writeInterfaceToken(IServiceManager::getInterfaceDescriptor());
@@ -200,6 +216,8 @@ class BpMediaPlayerService: public BpInterface<IMediaPlayerService>
    =>bwr.write_buffer = (uintptr_t)mOut.data();
    =>ioctl(mProcess->mDriverFD, BINDER_WRITE_READ, &bwr);
    可知最终就是包装目标和数据丢给binder驱动
+   Binder驱动把找到对端，生成本端的handle放到mOut
+   最终BpServiceManager拿着这个handle生成一个BBBinder对象最为BpXXX的remote()
 
 /******************|android binder进程/线程相关类封装|*****************/
 对Binder的IO操作C++封装:
@@ -252,6 +270,122 @@ class IInterface
    最后跟向SMGR注册驱动一样，
    Binder驱动会内核中为本进程创建BinderNode(包含Binder对象)，为对端进程创建BinderRef(包含handle)
    并建立映射handle到BinderNode的映射关系(通过红黑树实现)
+
+
+Java
+//IXX的父接口IInterface，只有一个接口asBinder
+public interface IInterface
+{
+    public IBinder asBinder();
+}
+//AIDL生成的IXXX, 果然继承IInterface
+//同时生成一个内部类Stub, 继承IXXX和android.os.Binder
+public interface IXXX extends android.os.IInterface {
+    public static abstract class Stub extends android.os.Binder implements IXXX {
+        private static class Proxy implements IXXX {
+            private android.os.IBinder mRemote;
+            Proxy(android.os.IBinder remote) {
+                mRemote = remote;
+            }
+            public android.os.IBinder asBinder() {
+                return mRemote;
+            }            
+        }
+        public static IXXX asInterface(android.os.IBinder obj) {
+            if ((obj == null)) {
+                return null;
+            }
+            //检查传过来的binder是否和现在的进程是同一进程，如果是，返回值不为null
+            android.os.IInterface iin = obj.queryLocalInterface(DESCRIPTOR);
+            if (((iin != null) && (iin instanceof IXXX))) {
+                return ((IXXX) iin);
+            }
+            //不是同一进程，返回stub的poxy
+            return new IXXX.Stub.Proxy(obj);//Proxy包裹BinderProxy(持有handle)
+        }
+    }
+}
+//Stud类似于native层的BnXXX
+//Proxy类似于native层BpXXX
+//IBinder类似于native层的IBinder
+public interface IBinder {
+    transact();
+}
+//Binder类似于native层的BBinder
+public class Binder implements IBinder {
+    onTransact();
+}
+//BinderProxy类似于native的BpBinder
+public final class BinderProxy implements IBinder {
+
+}
+
+//类似于native层BnServiceManager
+public abstract class ServiceManagerNative extends Binder implements IServiceManager
+{
+    调用子类onTransact实现具体功能
+}
+//类似于native层BpServiceManager
+class ServiceManagerProxy implements IServiceManager {
+    //利用BinderProxy做事情
+}
+//看看getService过程
+public final class ServiceManager{
+    //静态方法
+    getService/addService
+}
+先看怎么获取java层SMGR
+=>rawGetService(name)
+=>getIServiceManager().getService(name)
+=>sServiceManager = ServiceManagerNative.asInterface(Binder.allowBlocking(BinderInternal.getContextObject()));
+//猜测一下肯定创建一个BinderProxy对象
+//BinderInternal.getContextObject()是一个native接口
+=>android_os_BinderInternal_getContextObject()
+=>sp<IBinder> b = ProcessState::self()->getContextObject(NULL) //这就是一个BpBinder(0), 也就是Native的SMGR
+=>javaObjectForBinder();
+{
+    //创建BinderProxyNativeData对象
+    BinderProxyNativeData* nativeData = new BinderProxyNativeData();
+    nativeData->mOrgue = new DeathRecipientList;
+    //把native的SMGR赋给其mObject
+    nativeData->mObject = val;
+    //在native创建创建一个java BinderProxy对象，构造参数为native的BinderProxyNativeData
+    jobject object = env->CallStaticObjectMethod(gBinderProxyOffsets.mClass,
+             gBinderProxyOffsets.mGetInstance, (jlong) nativeData, (jlong) val.get()/*BpBinder(0)*/);
+}
+//jni调回java层的BinderProxy的getInstance()函数
+//这个静态函数给每个native的binder对应一个BinderProxy对象
+//ref: https://www.cnblogs.com/blogs-of-lxl/p/10088548.html
+//Q&A: https://www.jianshu.com/p/adaa1a39a274 
+private static BinderProxy getInstance(long nativeData, long iBinder) {
+    BinderProxy result;
+    synchronized (sProxyMap) {
+        result = sProxyMap.get(iBinder);
+        if (result != null) {
+            return result;
+        }
+        result = new BinderProxy(nativeData);   //关键点使用BinderProxyNativeData构造BinderProxy
+        sProxyMap.set(iBinder, result);
+    }
+    return result;
+}
+//然后用BinderProxy作为参数调用asInterface
+=>ServiceManagerNative.asInterface(BinderProxy(BpBinder(0)));
+=>return new ServiceManagerProxy(obj)
+=>相当于： ServiceManagerProxy(BinderProxy(BpBinder(0)));
+//BpServiceManager的remote是BpBinder
+//ServiceManagerProxy的remote是BinderProxy
+但最终BinderProxy又通过jni委托给了BpBinder
+getService委托过程
+   =>transact()
+   =>transactNative()
+   =>android_os_BinderProxy_transact();
+   {    //取回BpBinder对象
+        IBinder* target = getBPNativeData(env, obj)->mObject.get();
+        //通过native的BpBinder进行远程调用
+        target->transact(code, *data, reply, flags)
+    }
+
 
 /******************|android 虚拟机编译优化|*****************/
 4. Android App优化
