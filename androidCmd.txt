@@ -320,12 +320,12 @@ public final class BinderProxy implements IBinder {
 
 }
 
-//类似于native层BnServiceManager
+//ServiceManagerNative就是Aidl的Stub类似于native层BnServiceManager
 public abstract class ServiceManagerNative extends Binder implements IServiceManager
 {
     调用子类onTransact实现具体功能
 }
-//类似于native层BpServiceManager
+//ServiceManagerProxy就是aidl生成的Proxy类似于native层BpServiceManager
 class ServiceManagerProxy implements IServiceManager {
     //利用BinderProxy做事情
 }
@@ -384,8 +384,34 @@ getService委托过程
         IBinder* target = getBPNativeData(env, obj)->mObject.get();
         //通过native的BpBinder进行远程调用
         target->transact(code, *data, reply, flags)
-    }
+   }
+   最后返回IBinder binder = reply.readStrongBinder();
+   =>nativeReadStrongBinder()
+   实际上就是BinderProxy(BpBinder(handle))
+   最后再asInterface创建Prox(BinderProxy)
 
+2. 再看下怎么getService, 跟获取Java层SMGR一样，Java层对象Proxy通过BinderProxy包裹Native的BpBinder
+3. 最后看看addService, 先猜一下，应该是Native层的BnXXX对象包裹Java层的Stub对象
+   =>ServiceManagerProxy.addService()
+   =>writeStrongBinder(IBinder val)
+   =>nativeWriteStrongBinder(mNativePtr, val)
+   =>android_os_Parcel_writeStrongBinder(val)
+   =>parcel->writeStrongBinder(ibinderForJavaObject(env, val));
+   //从Binder的mObject得到JavaBinderHolder，那么JavaBinderHolder哪儿创建的呢？
+   //答案是这句代码mObject = getNativeBBinderHolder();在Java的Binder构造中调用得到
+   //android_os_Binder_getNativeBBinderHolder=>return new JavaBBinderHolder();
+   =>JavaBBinderHolder* jbh = (JavaBBinderHolder*)
+              env->GetLongField(obj, gBinderOffsets.mObject);   //得到JavaBBinderHolder
+   =>return jbh->get(env, obj); //然后返回其get, 猜测这里肯定是创建了BBinder对象
+   //class JavaBBinder : public BBinder
+   =>b = new JavaBBinder(env, obj);
+   //果然是这样，将Java的binder作为参数，创建对象存在其mObject，最后将JavaBBinder传给驱动
+   //回调通过反射调用Java的Binder的onTransact
+   =>env->CallBooleanMethod(mObject, gBinderOffsets.mExecTransact,
+              code, reinterpret_cast<jlong>(&data), reinterpret_cast<jlong>(reply), flags);
+
+总结：对于java层来说，客户端的java对象Proxy持有native的BpBinder(handle)
+                    服务端的java对象Stub被native的BpXXX持有
 
 /******************|android 虚拟机编译优化|*****************/
 4. Android App优化
@@ -449,11 +475,24 @@ Zygote启动App进程
 5. close只会剪断自我进程内的进程表项到文件表项的链接
 6. 通过进程间通信传递fd应该是不可行(除非fork)，待验证
 
-/******************|android Java层Binder客户端|*****************/
-1. 客户端BinderProxy请求
-   =>transact()
-   =>transactNative()
-   =>android_os_BinderProxy_transact();
-   //获取BpBinder对象
-   =>IBinder* target = getBPNativeData(env, obj)->mObject.get();
-   =>target->transact(code, *data, reply, flags)
+/******************|android Java层四大组件的binder通信|*****************/
+Activity/Service:
+    1. 创建Activity/Service使用Content的方法startXXX向AMS发送远程请求
+    2. 发送请求的时候附带一个Binder对象(ApplicationThread)给AMS调用本端方法实现双向通信
+    3. 想想也知道ApplicationThread里面实现了Activity和Service的生命周期回调了
+
+Service独有的：
+    1. binderService(ServiceConnection)请求绑定service, 传入一个连接回调对象
+       =>想想看这个回调对象ServiceConnection被肯定被包裹在一个Binder对象里面
+       =>验证 private static class InnerConnection extends IServiceConnection.Stub
+       =>{  //ServiceDispatcher对象包含了ServiceConnection
+            //ServiceDispatcher对象也包含了InnerConnection
+            //InnerConnection又包含了ServiceDispatcher
+            //所以Binder对象InnerConnection间接包含了ServiceConnection
+            static final class ServiceDispatcher {
+                private final ServiceDispatcher.InnerConnection mIServiceConnection;
+                private final ServiceConnection mConnection;
+        }
+    2. obBinder返回Binder对象
+    2. private void handleBindService()调用Service的onBinder
+        ActivityManager.getService().publishService(binder);   //将binder对象发布到AMS
