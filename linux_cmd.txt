@@ -5,6 +5,10 @@ rsync -r --copy-links --exclude="./prebuilts/" . /media/zengqiang/yuxugen1/zengq
 
 -------------------------------
 nautilus dir
+//递归在目录中的所有文件中搜索VK
+grep -nr xxx ./ 
+//递归在目录中的cpp文件中搜索VK
+find . -name "*.cpp"| xargs grep VK
 -------------------------------
 
 qnx多线程log最后打不全。。。。
