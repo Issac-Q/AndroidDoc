@@ -1,0 +1,28 @@
+https://blog.csdn.net/goodnight1994/article/details/119328739
+
+setView => 会传入一个空的InputChannel
+最终WMS调用到native层创建socketpair, 
+其中一个返回到App,
+另外一个注册到IMS,IMS最终调用到native层通过InputManager注册到InputDispatcher：先创建Connection,然后用socket的fd作为其map索引key
+IMS是在SystemServer进程中创建并启动的
+              traceBeginAndSlog("StartInputManagerService");
+              inputManager = new InputManagerService(context);	//注册“inputflinger”服务，实现类叫InputManager
+              traceEnd();
+IMS对象还会成为WMS的成员
+
+inputManager.start();	//启动读线程和派发线程
+
+
+reader: 1. 第一次扫描打开/dev/input下的所有设备
+		epoll监听所有设备，epoll监听inotify进而监听/dev/input目录输入设备的变化，然后打开和监听新的设备，删除并close移除的设备
+		最终将事件入队到dispatcher的队列mInboundQueue中，并唤醒dispatcher线程
+
+dispatcher: 1. 出队事件
+			2. 查找目标窗口：findTouchedWindowTargetsLocked，输入目标：inputTargets(std::vector)
+			3. inputTarget包含inputChannel，通过inputChannel的socketpair的fd在mConnectionsByFd中查找connection
+			4. 通过connect发布事件：connection->inputPublisher.publishMotionEvent，饶了一圈还是通过InputChannel的sendMessage发送socket消息
+
+App: 1. WindowInputEventReceiver持有客户端的InputChannel(socketpair),viewrootimpl启动线程调用到native(nativeConsumeBatchedInputEvents)
+	 2. native最终调用了InputTransport，InputConsumer::consume，最终还是InputChannel的receiveMessage收到Event
+	 3. native收到数据之后，调用java接口 dispatchInputEvent，把inputEventObj 传过去， 最终是调用dispatchInputEvent=>enqueueInputEvent, 又加入队列
+	 4. doProcessInputEvents开始处理事件	
